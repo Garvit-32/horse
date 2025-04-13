@@ -579,7 +579,8 @@ def process_video(tensor_file_path: str):
             # Orientation from Keypoints
             orientation_kp = "unknown"
             if kp_3d is not None:
-                 orientation_kp = get_horse_orientation(kp_3d, conf=ARGS.orientation_conf)
+                 orientation_kp = get_horse_orientation(kp_3d, conf=ARGS.orientation_conf) # TODO: check units of dx,dz. How was the confidence value decided?
+            
 
 
             # Orientation from DINO
