@@ -21,6 +21,29 @@ from itertools import groupby
 from typing import List, Tuple, Iterable
 import random
 
+import cv2
+import numpy as np
+
+def polygons_to_mask(polygons, shape):
+    """
+    polygons : List[List[Tuple[x, y]]]  – one or more closed polygons
+    shape    : (h, w) of the target mask
+    returns  : bool ndarray (h, w)
+    """
+    mask = np.zeros(shape, dtype=np.uint8)
+    # cv2 wants each polygon as (n_pts, 1, 2)
+    cv2.fillPoly(mask, [np.array(p, dtype=np.int32).reshape(-1, 1, 2)
+                        for p in polygons], 1)
+    return mask.astype(bool)
+
+
+def iou_bool(mask_a, mask_b):
+    """IoU for two boolean masks.  Returns nan if union == 0."""
+    inter = np.logical_and(mask_a, mask_b).sum()
+    union = np.logical_or(mask_a,  mask_b).sum()
+    return inter / union if union else np.nan
+
+
 def split_orientations(
     seq: List[str],
     possible_orientations ,
@@ -72,16 +95,16 @@ GLOBAL_ERROR_LIST = None # This will be a Manager.list
 def parse_args():
     parser = argparse.ArgumentParser(description="Optimized Video Processing Script")
     # --- Essential Paths ---
-    parser.add_argument('--data_dir', type=str, default = '/home/ubuntu/workspace/tmp_script_testing_data',  help="Root directory containing 'data_tensor', 'data', 'data_cropped'")
-    parser.add_argument('--json_dir', type=str, default = '/home/ubuntu/workspace/tmp_script_testing_data',  help="Root directory containing 'data_tensor', 'data', 'data_cropped'")
-    parser.add_argument('--dino_embeddings_dir', type=str, default = '/home/ubuntu/workspace/tmp_script_testing_data',  help="Root directory containing 'data_tensor', 'data', 'data_cropped'")
-    parser.add_argument('--dessie_embeddings_dir', type=str, default = '/home/ubuntu/workspace/tmp_script_testing_data',  help="Root directory containing 'data_tensor', 'data', 'data_cropped'")
+    parser.add_argument('--data_dir', type=str, default = '/home/ubuntu/workspace',  help="Root directory containing 'data_tensor', 'data', 'data_cropped'")
+    parser.add_argument('--json_dir', type=str, default = '/home/ubuntu/workspace',  help="Root directory containing 'data_tensor', 'data', 'data_cropped'")
+    parser.add_argument('--dino_embeddings_dir', type=str, default = '/home/ubuntu/workspace',  help="Root directory containing 'data_tensor', 'data', 'data_cropped'")
+    parser.add_argument('--dessie_embeddings_dir', type=str, default = '/home/ubuntu/workspace',  help="Root directory containing 'data_tensor', 'data', 'data_cropped'")
     parser.add_argument('--save_dir', type=str, default = 'videos',  help="Root directory to save processed videos")
     parser.add_argument('--prototype_path', type=str, default='/home/ubuntu/workspace/prototypes.pth', help="Path to pre-computed DINO prototypes")
     parser.add_argument('--ckpt_file', type=str, help="Path to DESSIE checkpoint (if used, currently inactive)") # Kept if needed later
 
     # --- Processing Parameters ---
-    parser.add_argument('--num_workers', type=int, default=2, help="Number of worker processes for DataLoader")
+    parser.add_argument('--num_workers', type=int, default=12, help="Number of worker processes for DataLoader")
     parser.add_argument('--dino_batch_size', type=int, default=2, help="Batch size for DINO inference")
     parser.add_argument('--imgsize', type=int, default=256, help="Target size for cropping/resizing (before DINO)") # Keep if used elsewhere
     parser.add_argument('--output_fps', type=int, default=20, help="FPS for the output videos")
@@ -135,7 +158,12 @@ def parse_args():
     parser.add_argument("--REALPATH", default='')
     parser.add_argument("--web_images_num", type=int, default=0)
     parser.add_argument("--REALMagicPonyPATH", default='')
-    parser.add_argument('--debug', default= True, action='store_true', help="Overlay predicted orientation text on frames")
+    parser.add_argument('--debug', default= False, action='store_true', help="Overlay predicted orientation text on frames")
+    parser.add_argument('--best_iou_thresh', type=float, default=0.10,
+                    help="IoU below which the frame counts as ‘un-occluded’")
+    parser.add_argument('--best_iou_ratio',  type=float, default=0.80,
+                    help="Min fraction of un-occluded frames to call it best view")
+
 
 
     return parser.parse_args()
@@ -383,13 +411,6 @@ def process_video(tensor_file_path: str):
         json_path = tensor_file_path.replace('data_tensor', 'data_cropped_new').replace('_results.pt', '_seg.json')
         dessie_path = tensor_file_path
         dino_path = tensor_file_path.replace('data_tensor', 'dino_tensor')
-        # print('='*60)
-        # print(video_path, json_path, tensor_file_path)
-        # print('='*60)
-
-        # output_base = os.path.join(ARGS.save_dir, base_path)
-        # output_dir_name = os.path.dirname(output_base)
-        # os.makedirs(output_dir_name, exist_ok=True)
 
 
     except Exception as e:
@@ -441,6 +462,15 @@ def process_video(tensor_file_path: str):
     if not needed_frame_indices:
          cap.release()
          return None # No frames specified
+
+    json_by_frame = collections.defaultdict(list)
+    if isinstance(frame_data, dict):  # your file uses this structure
+        for f_idx, objs in frame_data.items():
+            json_by_frame[int(f_idx)].extend(objs)
+    else:                             # fall-back for list-of-dict format
+        for item in frame_data:
+            json_by_frame[item["frame_idx"]].append(item)
+
 
     max_frame_idx = needed_frame_indices[-1]
     current_frame_idx = 0
@@ -518,9 +548,7 @@ def process_video(tensor_file_path: str):
     os.makedirs(output_dir_name, exist_ok=True)
 
     # --- 7. Process Frames and Write Output Videos ---
-    output_writers = {}
-    output_paths = {}
-    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+    fourcc = None
     orientations = ['left', 'right', 'front', 'back', 'unknown'] # Add unknown if needed
 
     # Define desired output size (e.g., original size or a fixed size)
@@ -567,16 +595,22 @@ def process_video(tensor_file_path: str):
         orientation_counts[direction] += 1
         seg_id   = orientation_counts[direction]
         vid_path = f"{output_base}_{direction}_{seg_id}.mp4"
-        pkl_path = f"{output_base}_{direction}_{seg_id}_dinop.pkl"
+        dino_pkl_path = f"{output_base}_{direction}_{seg_id}_dino.pkl"
+        dessie_pkl_path = f"{output_base}_{direction}_{seg_id}_dessie.pkl"
 
-        # open writer for this segment
-        writer = cv2.VideoWriter(
-            vid_path, fourcc, ARGS.output_fps, (output_width, output_height)
-        )
+        writer = None
+        if ARGS.debug:
+            fourcc  = cv2.VideoWriter_fourcc(*"mp4v")
+            writer = cv2.VideoWriter(
+                vid_path, fourcc, ARGS.output_fps, (output_width, output_height)
+            )
 
         # collectors for dinop embeddings of this segment
         dinop_scores: list[dict[str, float]] = []
         dinop_frames: list[int]               = []
+        dessie_embeds: list[np.ndarray]      = []  
+        dessie_frames: list[int]               = []
+        iou_scores: list[float] = [] 
 
         for _ in range(seg_len):
             if frame_ptr >= len(needed_frame_indices):
@@ -584,27 +618,75 @@ def process_video(tensor_file_path: str):
             idx = needed_frame_indices[frame_ptr]
             frame_ptr += 1
 
-            # resize (if needed) and write frame
-            frame = frames_dict[idx]
-            if frame.shape[:2] != (output_height, output_width):
-                frame = cv2.resize(frame, (output_width, output_height))
-            writer.write(frame)
+            horse_mask = None
+            person_mask = None
+
+            for obj in json_by_frame[idx]:
+                if obj["class_name"] == "horse":
+                    horse_mask = polygons_to_mask([obj["segmentation"]],
+                                                (frame_height, frame_width))
+                elif obj["class_name"] == "human":
+                    person_mask = polygons_to_mask([obj["segmentation"]],
+                                                (frame_height, frame_width))
+
+            iou_val = 0.0                   # default when no person
+            if person_mask is None:
+                iou_val = 0.0
+            elif horse_mask is not None:
+                iou_val = iou_bool(person_mask, horse_mask)
+
+            iou_scores.append(iou_val)   
+
+
+            if ARGS.debug:
+                frame = frames_dict[idx]
+                if frame.shape[:2] != (output_height, output_width):
+                    frame = cv2.resize(frame, (output_width, output_height))
+                writer.write(frame)
 
             # collect dinop scores (or embeddings) for this frame
             if idx in all_dino_preds:
                 dinop_scores.append(all_dino_preds[idx]["all_scores"])
                 dinop_frames.append(idx)
 
-        writer.release()
-        print(f"✓ {direction}_{seg_id}: {seg_len:4d} frames  → {vid_path}")
+            if idx in dessie_map:
+                kp3d = pred_data_dessie["pred_kp3d_crop"][dessie_map[idx]]
+                dessie_embeds.append(kp3d.cpu().numpy())
+                dessie_frames.append(idx)
+
+        if writer is not None:
+            writer.release()
+            print(f"✓ {direction}_{seg_id}: {seg_len:4d} frames  → {vid_path}")
+
+
+        ratio_clean = np.mean(np.array(iou_scores) < ARGS.best_iou_thresh)
+        is_best     = ratio_clean >= ARGS.best_iou_ratio
+        prefix      = "unoccluded_" if is_best else ""
+        # new_vid_path        = f"{output_base}_{prefix}{direction}_{seg_id}.mp4"
+        dino_pkl_path   = f"{output_base}_{prefix}{direction}_{seg_id}_dino.pkl"
+        dessie_pkl_path = f"{output_base}_{prefix}{direction}_{seg_id}_dessie.pkl"
 
         # dump dinop embedding info for this segment
-        with open(pkl_path, "wb") as f:
+        with open(dino_pkl_path, "wb") as f:
             pickle.dump(
                 {"frame_indices": dinop_frames,
                 "dinop_scores" : dinop_scores}, f
             )
-        print(f"  ↳ dinop embeddings saved               → {pkl_path}")
+        print(f"  ↳ dinop embeddings saved               → {dino_pkl_path}")
+
+
+        with open(dessie_pkl_path, "wb") as f:
+            pickle.dump(
+                {"frame_indices": dessie_frames,
+                "dessie_embeddings" : dessie_embeds}, f
+            )
+        print(f"  ↳ dessie embeddings saved               → {dessie_pkl_path}")
+
+        if ARGS.debug and os.path.exists(vid_path):          # ← old name still in vid_path
+            new_path = f"{output_base}_{prefix}{direction}_{seg_id}.mp4"
+            if vid_path != new_path:
+                os.rename(vid_path, new_path)
+                vid_path = new_path
 
     # ------------------------------------------------------------------
     # 7-d. Optional: build a single debug video with orientation overlay
@@ -671,11 +753,20 @@ def collate_fn(batch):
     return batch
 
 import glob, os
-
+from pathlib import Path
 def is_processed(pt_path: str) -> bool:
-    vid_path = pt_path.replace("data_tensor", "dataset").replace("_results.pt", ".mp4")
-    out_base = vid_path.replace("dataset", "videos")[:-4]
-    return bool(glob.glob(f"{out_base}_*.mp4"))
+    base = (Path(pt_path)
+            .as_posix()
+            .replace("data_tensor", "output_videos_split")   # output tree
+            .replace("_results.pt", "")                      # strip suffix
+            .replace("/dataset/", "/"))                      # keep sub-dirs
+
+    # Step-2: any pickle (DINO or DESSIE, occluded or not) counts
+    patterns = [
+        f"{base}_*.pkl",                 # generic – covers DINO / DESSIE
+        f"{base}_unoccluded_*.pkl"
+    ]
+    return any(glob.glob(pat) for pat in patterns)
 
 # --- Main Execution ---
 if __name__ == "__main__":
@@ -688,7 +779,7 @@ if __name__ == "__main__":
     # random.shuffle(tensor_files)
     tensor_files = tensor_files
     # breakpoint()
-    # tensor_files = [p for p in list_pt_files(tensor_root) if not is_processed(p)]
+    tensor_files = [p for p in list_pt_files(tensor_root) if not is_processed(p)]
     print(f"{len(tensor_files)} videos need processing.")
     
     if not tensor_files:
