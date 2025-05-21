@@ -394,8 +394,17 @@ def process_video_optimized(video_path, batch_size=16):
 
     # tensor_idx_map = {entry['frame_idx']: i for i, entry in enumerate(frame_data)}
 
+    try:
 
-    tensor_frame_idx_list = pred_data['frame_idx'].tolist()
+        tensor_frame_idx_list = pred_data['frame_idx'].tolist()
+    except:
+        msg = f"Error no frame_idx {video_path}"
+        print(msg)
+        GLOBAL_ERROR_LIST.append(video_path)
+        return tensor_path
+
+
+
 
     # 3. Frame Processing Loop (access frames from indexed_frames)
     for frame_idx, data in frame_data.items():
@@ -553,7 +562,7 @@ if __name__ == "__main__":
 
     
 
-    num_processes = 4 # Number of subprocesses to use - as requested
+    num_processes = 2 # Number of subprocesses to use - as requested
 
     manager = mp.Manager()
     shared_error_list = manager.list() # Create a shared list for errors
